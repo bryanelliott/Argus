@@ -87,15 +87,14 @@ function Assert-True($Condition, $Message) {
 
 $results = @(& $scriptPath -PassThru -ThrottleLimit 1 -WarningAction SilentlyContinue)
 Assert-True ($global:ArgusTest_loginCount -eq 0) 'Valid login should be reused.'
-Assert-True ($results.Count -eq 3) 'Policy intersection must include three regions.'
+Assert-True ($results.Count -eq 2) 'Only matching regions and failed queries should remain in the output.'
 Assert-True ('northus' -notin $global:ArgusTest_queriedRegions) 'Excluded regions must not be queried.'
 Assert-True (($results | Where-Object Location -eq 'eastus').RecommendedSKU -eq 'Standard_B1ms') 'Choose the smallest eligible x64 SKU, allowing zone-only restrictions.'
-Assert-True (($results | Where-Object Location -eq 'westus').Status -eq 'No matching available SKU') 'Report no match.'
+Assert-True ('westus' -notin $results.Location) 'Omit regions with no matching candidates.'
 Assert-True (($results | Where-Object Location -eq 'centralus').Status -eq 'Query failed; see warning') 'Report individual query errors and continue.'
 $east = $results | Where-Object Location -eq 'eastus'
 Assert-True ($east.QuotaUsed -eq 2 -and $east.QuotaLimit -eq 4 -and $east.QuotaRemaining -eq 2) 'Match the exact SKU family, not the first B-family quota.'
 Assert-True ($east.QuotaStatus -eq 'Sufficient family quota') 'Report quota headroom in vCPUs.'
-Assert-True (($results | Where-Object Location -eq 'westus').Quota -like '*standardBSFamily: 2/4*') 'Show regional B-family quotas when there is no matching SKU.'
 
 $global:ArgusTest_expired = $true
 $global:ArgusTest_nested = $true

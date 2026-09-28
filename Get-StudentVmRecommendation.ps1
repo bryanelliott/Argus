@@ -245,10 +245,7 @@ $results = foreach ($region in $regionalData) {
         # Prefer the smallest eligible hardware footprint; this is not a price comparison.
         $recommendation = $candidates | Sort-Object vCPUs, MemoryGB, RecommendedSKU | Select-Object -First 1
         if (-not $recommendation) {
-            $recommendation = [pscustomobject]@{
-                Location = $location; RecommendedSKU = $null; vCPUs = $null
-                MemoryGB = $null; QuotaFamily = $null; Status = 'No matching available SKU'
-            }
+            continue
         }
     }
     catch {

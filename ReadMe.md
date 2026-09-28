@@ -2,11 +2,33 @@
 
 Find deployment regions and small VM sizes for COMP77 students at St. Lawrence College using Azure for Students subscriptions.
 
-Requires PowerShell 5.1 or later and [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli).
+Requires **PowerShell 5.1 or later** and **Azure CLI**. Install [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) before running the script, then reopen PowerShell and confirm it is available:
+
+```powershell
+az --version
+```
+
+Open PowerShell in the folder containing the downloaded script (extract it first if downloaded as a ZIP), then run:
 
 ```powershell
 .\Get-StudentVmRecommendation.ps1
 ```
+
+If Windows blocks the script because it was downloaded from the Internet or is not digitally signed, review the script and unblock the file:
+
+```powershell
+Unblock-File -LiteralPath .\Get-StudentVmRecommendation.ps1
+.\Get-StudentVmRecommendation.ps1
+```
+
+If PowerShell still reports that running scripts is disabled, allow local and unblocked scripts for the **current PowerShell session only**, then run it again:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+.\Get-StudentVmRecommendation.ps1
+```
+
+Accept the confirmation prompt if shown. The session policy change expires when you close PowerShell and does not require administrator access. `Unblock-File` removes the download marker from that file; it does not change the execution policy. An organization-enforced policy can override the session setting. If it still blocks execution, run `Get-ExecutionPolicy -List` and contact your instructor or IT support. See Microsoft's [execution policy documentation](https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_execution_policies) for details.
 
 The script reuses Azure CLI's selected subscription and checks authentication. If sign-in is needed, it runs `az login` and attempts to restore the previously selected subscription. On first use, select your student subscription during login. You can also choose one explicitly:
 
@@ -24,9 +46,9 @@ Regional checks run concurrently, with up to five regions active at once. Each w
 .\Get-StudentVmRecommendation.ps1 -ThrottleLimit 6
 ```
 
-The table includes each location, recommended SKU, CPU count, RAM, quota family, quota usage/limit, remaining vCPUs, and status. Quota is matched using the SKU's actual family identifier, so older B-series and newer B-series families use their own limits. For example, `2/4 (2 free)` means two vCPUs are used out of a four-vCPU family limit. Insufficient quota is flagged without hiding the matching SKU or changing the hardware ranking. Unknown quota is not treated as zero. Where no SKU matches, all returned B-family quotas are shown for that region.
+The table includes each location, recommended SKU, CPU count, RAM, quota family, quota usage/limit, remaining vCPUs, and status. Quota is matched using the SKU's actual family identifier, so older B-series and newer B-series families use their own limits. For example, `2/4 (2 free)` means two vCPUs are used out of a four-vCPU family limit. Insufficient quota is flagged without hiding the matching SKU or changing the hardware ranking. Unknown quota is not treated as zero.
 
-Regions with no match or a failed query remain visible. `-PassThru` also exposes numeric `QuotaUsed`, `QuotaLimit`, and `QuotaRemaining` fields plus `QuotaStatus`. To save results:
+Regions with no matching candidate SKUs are omitted from both the table and exported results. Failed queries remain visible. `-PassThru` also exposes numeric `QuotaUsed`, `QuotaLimit`, and `QuotaRemaining` fields plus `QuotaStatus`. To save results:
 
 ```powershell
 .\Get-StudentVmRecommendation.ps1 -PassThru |

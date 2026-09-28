@@ -18,14 +18,22 @@ It reads the **Allowed resource deployment regions** policy assignment and saves
 
 For each region, the script recommends a **B-series, x64 VM with 1 or 2 vCPUs and 2 to 4 GB RAM**, excluding sizes with regional subscription restrictions. It prefers fewer vCPUs, then less RAM, then SKU name for a stable tie-break. This favors a small hardware footprint; it does not compare prices. Missing architecture information is not assumed to mean x64.
 
-The table includes each location, recommended SKU, CPU count, RAM, and status. Regions with no match or a failed query remain visible. To save results:
+Regional checks run concurrently, with up to five regions active at once. Each worker runs `az vm list-skus` and `az vm list-usage` for its region. To adjust concurrency (use `1` for serial execution):
+
+```powershell
+.\Get-StudentVmRecommendation.ps1 -ThrottleLimit 6
+```
+
+The table includes each location, recommended SKU, CPU count, RAM, quota family, quota usage/limit, remaining vCPUs, and status. Quota is matched using the SKU's actual family identifier, so older B-series and newer B-series families use their own limits. For example, `2/4 (2 free)` means two vCPUs are used out of a four-vCPU family limit. Insufficient quota is flagged without hiding the matching SKU or changing the hardware ranking. Unknown quota is not treated as zero. Where no SKU matches, all returned B-family quotas are shown for that region.
+
+Regions with no match or a failed query remain visible. `-PassThru` also exposes numeric `QuotaUsed`, `QuotaLimit`, and `QuotaRemaining` fields plus `QuotaStatus`. To save results:
 
 ```powershell
 .\Get-StudentVmRecommendation.ps1 -PassThru |
     Export-Csv .\vm-recommendations.csv -NoTypeInformation
 ```
 
-Recommendations assume deployment **without an availability zone**. Zone-only restrictions do not exclude a size. Available capacity, remaining vCPU quota, image compatibility, and other policies can still prevent deployment; this script does not deploy resources or validate all such constraints.
+Recommendations assume deployment **without an availability zone**. Zone-only restrictions do not exclude a size. Quota is a snapshot, measured in vCPUs rather than VM count. Total regional vCPU quota is a separate limit and is not checked. Available capacity, image compatibility, and other policies can also prevent deployment; this script does not deploy resources or validate all such constraints.
 
-Azure CLI references: [policy assignment list](https://learn.microsoft.com/cli/azure/policy/assignment#az-policy-assignment-list) and [vm list-skus](https://learn.microsoft.com/cli/azure/vm#az-vm-list-skus).
+Azure CLI references: [policy assignment list](https://learn.microsoft.com/cli/azure/policy/assignment#az-policy-assignment-list), [vm list-skus](https://learn.microsoft.com/cli/azure/vm#az-vm-list-skus), and [vCPU quotas / list-usage](https://learn.microsoft.com/azure/virtual-machines/quotas).
 

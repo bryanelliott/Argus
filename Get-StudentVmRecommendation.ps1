@@ -6,11 +6,15 @@ Finds small x64 B-series VMs in the subscription's allowed deployment regions.
 Optional subscription name or ID. Otherwise reuses Azure CLI's current subscription.
 .PARAMETER PassThru
 Returns objects for export or further processing instead of a formatted table.
+.PARAMETER ThrottleLimit
+Maximum concurrent regional checks. Defaults to five; use one for serial checks.
 #>
 [CmdletBinding()]
 param(
     [string] $Subscription,
-    [switch] $PassThru
+    [switch] $PassThru,
+    [ValidateRange(1, 16)]
+    [int] $ThrottleLimit = 5
 )
 
 $ErrorActionPreference = 'Stop'
@@ -48,6 +52,73 @@ function Invoke-AzJson {
     }
     finally {
         Remove-Item -LiteralPath $errorFile -Force
+    }
+}
+
+function Invoke-RegionQueries {
+    param([string[]] $Locations, [string] $SubscriptionId, [int] $Concurrency)
+
+    $worker = {
+        param($Location, $SubscriptionId, $AzPath, $InvokeDefinition)
+        $ErrorActionPreference = 'Stop'
+        $PSNativeCommandUseErrorActionPreference = $false
+        $azCommand = Get-Command $AzPath -ErrorAction Stop
+        Set-Item -Path Function:Invoke-AzJson -Value ([scriptblock]::Create($InvokeDefinition))
+        $result = [pscustomobject]@{
+            Location = $Location; Skus = @(); Usage = @(); SkuError = $null; QuotaError = $null
+        }
+        try {
+            $result.Skus = @(Invoke-AzJson -Arguments @(
+                'vm', 'list-skus', '--subscription', $SubscriptionId,
+                '--location', $Location, '--resource-type', 'virtualMachines', '--all', 'true'
+            ))
+        }
+        catch { $result.SkuError = $_.Exception.Message }
+        # Query quota even when the SKU lookup fails, so the regional quota remains visible.
+        try {
+            $result.Usage = @(Invoke-AzJson -Arguments @(
+                'vm', 'list-usage', '--subscription', $SubscriptionId, '--location', $Location
+            ))
+        }
+        catch { $result.QuotaError = $_.Exception.Message }
+        $result
+    }
+    $definition = ${function:Invoke-AzJson}.ToString()
+    $azPath = $azCommand.Source
+    if (-not $azPath) { $azPath = $azCommand.Name }
+    if ($Concurrency -eq 1) {
+        foreach ($location in $Locations) { & $worker $location $SubscriptionId $azPath $definition }
+        return
+    }
+
+    # Runspaces work in Windows PowerShell 5.1 without installing ThreadJob or PS 7.
+    $pool = [runspacefactory]::CreateRunspacePool(1, $Concurrency)
+    $pending = New-Object System.Collections.ArrayList
+    try {
+        $pool.Open()
+        foreach ($location in $Locations) {
+            $pipeline = [powershell]::Create()
+            $pipeline.RunspacePool = $pool
+            $null = $pipeline.AddScript($worker.ToString()).AddArgument($location).
+                AddArgument($SubscriptionId).AddArgument($azPath).AddArgument($definition)
+            $entry = [pscustomobject]@{ Pipeline = $pipeline; Handle = $null; Location = $location }
+            $null = $pending.Add($entry)
+            $entry.Handle = $pipeline.BeginInvoke()
+        }
+        foreach ($entry in $pending) {
+            $output = @($entry.Pipeline.EndInvoke($entry.Handle))
+            if ($entry.Pipeline.Streams.Error.Count -gt 0 -or $output.Count -ne 1) {
+                throw "Regional worker failed for $($entry.Location): $($entry.Pipeline.Streams.Error)"
+            }
+            $output
+        }
+    }
+    finally {
+        foreach ($entry in $pending) {
+            if ($entry.Handle -and -not $entry.Handle.IsCompleted) { $entry.Pipeline.Stop() }
+            $entry.Pipeline.Dispose()
+        }
+        $pool.Dispose()
     }
 }
 
@@ -129,13 +200,15 @@ foreach ($policy in $matchingPolicies) {
 }
 if ($listOfAllowedLocations.Count -eq 0) { throw 'The region policies have no allowed locations in common.' }
 
-$results = foreach ($location in $listOfAllowedLocations) {
-    Write-Host "Checking $location..."
+Write-Host "Checking $($listOfAllowedLocations.Count) regions (up to $ThrottleLimit concurrently)..."
+Write-Warning 'Checking available VM SKUs may take some time, even when regions are checked concurrently. Please wait for the results.'
+$regionalData = @(Invoke-RegionQueries -Locations $listOfAllowedLocations -SubscriptionId $account.id -Concurrency $ThrottleLimit)
+$results = foreach ($region in $regionalData) {
+    $location = $region.Location
+    $recommendation = $null
     try {
-        $skus = @(Invoke-AzJson -Arguments @(
-            'vm', 'list-skus', '--subscription', $account.id,
-            '--location', $location, '--resource-type', 'virtualMachines', '--all', 'true'
-        ))
+        if ($region.SkuError) { throw $region.SkuError }
+        $skus = $region.Skus
         $candidates = @(
             foreach ($sku in $skus) {
                 if ($sku.resourceType -ne 'virtualMachines' -or $sku.name -notmatch '^Standard_B' -or
@@ -164,28 +237,70 @@ $results = foreach ($location in $listOfAllowedLocations) {
                     RecommendedSKU = $sku.name
                     vCPUs = $cpu
                     MemoryGB = $memory
+                    QuotaFamily = $sku.family
                     Status = 'Match (no zone specified)'
                 }
             }
         )
         # Prefer the smallest eligible hardware footprint; this is not a price comparison.
         $recommendation = $candidates | Sort-Object vCPUs, MemoryGB, RecommendedSKU | Select-Object -First 1
-        if ($recommendation) { $recommendation }
-        else {
-            [pscustomobject]@{
+        if (-not $recommendation) {
+            $recommendation = [pscustomobject]@{
                 Location = $location; RecommendedSKU = $null; vCPUs = $null
-                MemoryGB = $null; Status = 'No matching available SKU'
+                MemoryGB = $null; QuotaFamily = $null; Status = 'No matching available SKU'
             }
         }
     }
     catch {
         Write-Warning "Could not query ${location}: $_"
-        [pscustomobject]@{
+        $recommendation = [pscustomobject]@{
             Location = $location; RecommendedSKU = $null; vCPUs = $null
-            MemoryGB = $null; Status = 'Query failed; see warning'
+            MemoryGB = $null; QuotaFamily = $null; Status = 'Query failed; see warning'
         }
     }
+
+    $quotaUsed = $null
+    $quotaLimit = $null
+    $quotaRemaining = $null
+    $quotaStatus = 'Unknown'
+    $quotaText = 'Unknown'
+    if ($region.QuotaError) {
+        Write-Warning "Could not query quota for ${location}: $($region.QuotaError)"
+        $quotaText = 'Query failed'
+    }
+    elseif ($recommendation.RecommendedSKU) {
+        $quota = $region.Usage | Where-Object {
+            $recommendation.QuotaFamily -and $_.name.value -eq $recommendation.QuotaFamily
+        } | Select-Object -First 1
+        if ($quota -and $null -ne $quota.currentValue -and $null -ne $quota.limit) {
+            $quotaUsed = [long]$quota.currentValue
+            $quotaLimit = [long]$quota.limit
+            $quotaRemaining = [math]::Max(0, $quotaLimit - $quotaUsed)
+            $quotaText = "$quotaUsed/$quotaLimit ($quotaRemaining free)"
+            if ($quotaRemaining -ge $recommendation.vCPUs) { $quotaStatus = 'Sufficient family quota' }
+            else { $quotaStatus = 'Insufficient family quota' }
+        }
+        else { $quotaText = 'Family quota not returned' }
+    }
+    else {
+        # With no recommended SKU there is no single corresponding family.
+        $familyQuotas = @($region.Usage | Where-Object { $_.name.value -match '^standardB.*Family$' })
+        if ($familyQuotas.Count -gt 0) {
+            $quotaText = ($familyQuotas | Sort-Object { $_.name.value } | ForEach-Object {
+                "$($_.name.value): $($_.currentValue)/$($_.limit)"
+            }) -join '; '
+            $quotaStatus = 'No SKU selected; all B-family quotas shown'
+        }
+        else { $quotaText = 'B-family quotas not returned' }
+    }
+    $recommendation | Add-Member -NotePropertyMembers @{
+        QuotaUsed = $quotaUsed; QuotaLimit = $quotaLimit; QuotaRemaining = $quotaRemaining
+        QuotaStatus = $quotaStatus; Quota = $quotaText
+    }
+    $recommendation
 }
 
 if ($PassThru) { $results }
-else { $results | Format-Table Location, RecommendedSKU, vCPUs, MemoryGB, Status -AutoSize }
+else {
+    $results | Format-Table Location, RecommendedSKU, vCPUs, MemoryGB, QuotaFamily, Quota, QuotaStatus, Status -AutoSize -Wrap
+}

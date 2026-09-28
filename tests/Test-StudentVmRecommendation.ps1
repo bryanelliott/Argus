@@ -7,11 +7,13 @@ $global:ArgusTest_nested = $false
 $global:ArgusTest_missingPolicy = $false
 $global:ArgusTest_selectedSubscription = $null
 $global:ArgusTest_queriedRegions = @()
+$global:ArgusTest_quotaLimit = 4
+$global:ArgusTest_quotaFailure = $false
 
 function New-TestSku {
     param($Name, $Cpu, $Memory, $Architecture = 'x64', $Restrictions = @())
     @{
-        name = $Name; resourceType = 'virtualMachines'; locations = @('eastus')
+        name = $Name; family = 'standardBSFamily'; resourceType = 'virtualMachines'; locations = @('eastus')
         restrictions = $Restrictions
         capabilities = @(
             @{ name = 'vCPUs'; value = "$Cpu" }
@@ -68,6 +70,13 @@ function az {
             )
             ConvertTo-Json -InputObject $skus -Depth 10
         }
+        'vm list-usage' {
+            if ($global:ArgusTest_quotaFailure) { $global:LASTEXITCODE = 1; break }
+            ConvertTo-Json -Depth 5 -InputObject @(
+                @{ name = @{ value = 'standardBsv2Family' }; currentValue = 0; limit = 99 }
+                @{ name = @{ value = 'standardBSFamily' }; currentValue = 2; limit = $global:ArgusTest_quotaLimit }
+            )
+        }
         default { throw "Unexpected mock command: $args" }
     }
 }
@@ -76,23 +85,36 @@ function Assert-True($Condition, $Message) {
     if (-not $Condition) { throw "FAILED: $Message" }
 }
 
-$results = @(& $scriptPath -PassThru -WarningAction SilentlyContinue)
+$results = @(& $scriptPath -PassThru -ThrottleLimit 1 -WarningAction SilentlyContinue)
 Assert-True ($global:ArgusTest_loginCount -eq 0) 'Valid login should be reused.'
 Assert-True ($results.Count -eq 3) 'Policy intersection must include three regions.'
 Assert-True ('northus' -notin $global:ArgusTest_queriedRegions) 'Excluded regions must not be queried.'
 Assert-True (($results | Where-Object Location -eq 'eastus').RecommendedSKU -eq 'Standard_B1ms') 'Choose the smallest eligible x64 SKU, allowing zone-only restrictions.'
 Assert-True (($results | Where-Object Location -eq 'westus').Status -eq 'No matching available SKU') 'Report no match.'
 Assert-True (($results | Where-Object Location -eq 'centralus').Status -eq 'Query failed; see warning') 'Report individual query errors and continue.'
+$east = $results | Where-Object Location -eq 'eastus'
+Assert-True ($east.QuotaUsed -eq 2 -and $east.QuotaLimit -eq 4 -and $east.QuotaRemaining -eq 2) 'Match the exact SKU family, not the first B-family quota.'
+Assert-True ($east.QuotaStatus -eq 'Sufficient family quota') 'Report quota headroom in vCPUs.'
+Assert-True (($results | Where-Object Location -eq 'westus').Quota -like '*standardBSFamily: 2/4*') 'Show regional B-family quotas when there is no matching SKU.'
 
 $global:ArgusTest_expired = $true
 $global:ArgusTest_nested = $true
-$results = @(& $scriptPath -PassThru -WarningAction SilentlyContinue)
+$results = @(& $scriptPath -PassThru -ThrottleLimit 1 -WarningAction SilentlyContinue)
 Assert-True ($global:ArgusTest_loginCount -eq 1) 'Expired authentication must trigger login.'
 Assert-True ($global:ArgusTest_selectedSubscription -eq 'student-id') 'Restore the previous subscription.'
 Assert-True (($results | Where-Object Location -eq 'eastus').RecommendedSKU -eq 'Standard_B1ms') 'Support nested policy properties.'
 
-$null = & $scriptPath -Subscription 'explicit-id' -PassThru -WarningAction SilentlyContinue
+$null = & $scriptPath -Subscription 'explicit-id' -PassThru -ThrottleLimit 1 -WarningAction SilentlyContinue
 Assert-True ($global:ArgusTest_selectedSubscription -eq 'explicit-id') 'Honor an explicit subscription.'
+
+$global:ArgusTest_quotaLimit = 2
+$results = @(& $scriptPath -PassThru -ThrottleLimit 1 -WarningAction SilentlyContinue)
+$east = $results | Where-Object Location -eq 'eastus'
+Assert-True ($east.QuotaRemaining -eq 0 -and $east.QuotaStatus -eq 'Insufficient family quota') 'Flag exhausted quota without hiding the matching SKU.'
+$global:ArgusTest_quotaFailure = $true
+$results = @(& $scriptPath -PassThru -ThrottleLimit 1 -WarningAction SilentlyContinue)
+$east = $results | Where-Object Location -eq 'eastus'
+Assert-True ($east.RecommendedSKU -eq 'Standard_B1ms' -and $null -eq $east.QuotaLimit -and $east.QuotaStatus -eq 'Unknown') 'A failed quota request must not erase the SKU or imply a zero quota.'
 
 $global:ArgusTest_missingPolicy = $true
 $failed = $false
